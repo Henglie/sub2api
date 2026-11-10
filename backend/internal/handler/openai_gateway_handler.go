@@ -489,24 +489,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	} else if changed {
 		body = cappedBody
 	}
-	if normalizedBody, changed := normalizeCodexPageContext(body); changed {
-		body = normalizedBody
-		reqLog.Info("openai.codex_page_context_normalized",
-			zap.String("normalization", "call_output_to_user_message"),
-		)
-	}
-	if normalizedBody, changed := normalizeCodexAutomationBootstrap(body); changed {
-		body = normalizedBody
-		reqLog.Info("openai.codex_automation_bootstrap_normalized",
-			zap.String("normalization", "call_output_to_user_message"),
-		)
-	}
-	if normalizedBody, changed := normalizeCodexDelegationBootstrap(body); changed {
-		body = normalizedBody
-		reqLog.Info("openai.codex_delegation_bootstrap_normalized",
-			zap.String("normalization", "call_output_to_user_message"),
-		)
-	}
+	body = normalizeOpenAIResponsesToolContext(body, reqLog)
 
 	reqStream, ok := parseOpenAICompatibleStream(body)
 	if !ok {
@@ -1709,6 +1692,34 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
 	return false
 }
 
+func normalizeOpenAIResponsesToolContext(body []byte, reqLog *zap.Logger) []byte {
+	if normalizedBody, changed := normalizeCodexPageContext(body); changed {
+		body = normalizedBody
+		reqLog.Info("openai.codex_page_context_normalized",
+			zap.String("normalization", "call_output_to_user_message"),
+		)
+	}
+	if normalizedBody, changed := normalizeCodexNamespacedCallOutput(body); changed {
+		body = normalizedBody
+		reqLog.Info("openai.codex_namespaced_call_output_normalized",
+			zap.String("normalization", "call_output_to_user_message"),
+		)
+	}
+	if normalizedBody, changed := normalizeCodexAutomationBootstrap(body); changed {
+		body = normalizedBody
+		reqLog.Info("openai.codex_automation_bootstrap_normalized",
+			zap.String("normalization", "call_output_to_user_message"),
+		)
+	}
+	if normalizedBody, changed := normalizeCodexDelegationBootstrap(body); changed {
+		body = normalizedBody
+		reqLog.Info("openai.codex_delegation_bootstrap_normalized",
+			zap.String("normalization", "call_output_to_user_message"),
+		)
+	}
+	return body
+}
+
 func normalizeCodexDelegationBootstrap(body []byte) ([]byte, bool) {
 	if !mayContainCodexCallOutputCandidate(body, "create_thread", "send_message_to_thread") {
 		return body, false
@@ -1724,6 +1735,76 @@ func normalizeCodexAutomationBootstrap(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return normalizeCodexCallOutputBootstrap(body, isCodexAutomationCandidate, false)
+}
+
+func normalizeCodexNamespacedCallOutput(body []byte) ([]byte, bool) {
+	if !mayContainCodexNamespacedCallOutput(body) || !hasUniqueJSONMembers(body) {
+		return body, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var request map[string]any
+	if err := decoder.Decode(&request); err != nil {
+		return body, false
+	}
+	input, ok := request["input"].([]any)
+	if !ok {
+		return body, false
+	}
+	changed := false
+	for i, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok || !isCodexNamespacedCallOutputCandidate(item) {
+			continue
+		}
+		output := item["output"].(string)
+		input[i] = map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{map[string]any{
+				"type": "input_text",
+				"text": output,
+			}},
+		}
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	normalized, err := json.Marshal(request)
+	if err != nil {
+		return body, false
+	}
+	return normalized, true
+}
+
+func mayContainCodexNamespacedCallOutput(body []byte) bool {
+	if bytes.Contains(body, []byte(`\u`)) {
+		return true
+	}
+	return bytes.Contains(body, []byte("function_call_output")) && bytes.Contains(body, []byte(`"namespace"`))
+}
+
+func isCodexNamespacedCallOutputCandidate(item map[string]any) bool {
+	if stringField(item, "type") != "function_call_output" {
+		return false
+	}
+	if callIDValue, exists := item["call_id"]; exists && callIDValue != nil {
+		callID, ok := callIDValue.(string)
+		if !ok || strings.TrimSpace(callID) != "" {
+			return false
+		}
+	}
+	namespace := stringField(item, "namespace")
+	name := stringField(item, "name")
+	if namespace == "" || name == "" {
+		return false
+	}
+	if namespace != "agent" && !strings.HasPrefix(name, "codex_apps_") {
+		return false
+	}
+	_, ok := item["output"].(string)
+	return ok
 }
 
 // mayContainCodexCallOutputCandidate is a necessary condition for a bootstrap
